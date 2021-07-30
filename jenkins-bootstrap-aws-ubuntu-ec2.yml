@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS CloudFormation Sample Template for bootstrapping a jenkins server on an ec2-ubuntu instance.
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+  InstanceType:
+    Description: Jenkins Server EC2 instance type.
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m1.small
+      - m1.medium
+      - m1.large
+      - m1.xlarge
+  LatestLinuxAmiId:
+    Description: Fectching ubuntu AMI from parameter store.
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/ec2/ubuntu/us-east-1/image_id'
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  
+Resources:
+  # this instance will be automatically updated 
+  # when we change the parameter in SSM ourselves
+  # and then run the CloudFormation template
+  JenkinsServerHost:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Jenkins server on ubuntu distro
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - 01-cfn-hup-install
+            - 02-jenkins-install
+        # Cfn-hup setting, it is to monitor the change of metadata.
+        # When there is change in the contents of json file in the metadata section, cfn-hup will call cfn-init to restart the AmazonCloudWatchAgent.
+        01-cfn-hup-install:
+          files:
+            '/etc/cfn/cfn-hup.conf':
+               content: !Sub |
+                 [main]
+                 stack=${AWS::StackId}
+                 region=${AWS::Region}
+                 interval=2
+               mode: '000400'
+               owner: root
+               group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+               content: !Sub |
+                 [cfn-auto-reloader-hook]
+                 triggers=post.update
+                 path=Resources.JenkinsServerHost.Metadata.AWS::CloudFormation::Init.default
+                 action=/usr/local/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsServerHost --region ${AWS::Region} --configsets default
+                 runas=root
+               mode: '000400'
+               owner: root
+               group: root
+            '/lib/systemd/system/cfn-hup.service':
+                content: !Sub |
+                  [Unit]
+                  Description=cfn-hup daemon
+                  [Service]
+                  Type=simple
+                  ExecStart=/usr/local/bin/cfn-hup
+                  Restart=always
+                  [Install]
+                  WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: !Sub |
+                systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: !Sub |
+                systemctl start cfn-hup.service
+        02-jenkins-install:
+            commands:
+              01-installing-java:
+                command: !Sub |
+                  apt-get install -y openjdk-8-jdk openjdk-8-jdk-headless
+              02-add-repo-key-to-sys:
+                command: !Sub |
+                  wget -q -O - https://pkg.jenkins.io/debian/jenkins-ci.org.key | sudo apt-key add -
+              03-add-entry-jenkins-list:
+                command: !Sub |
+                  sh -c 'echo deb http://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
+              04-update-package:
+                command: !Sub |
+                  apt-get update -y
+              05-install-jenkins:
+                command: !Sub |
+                  apt-get install -y jenkins
+              06-retrieve-admin-password:
+                command: !Sub |
+                  cat /var/lib/jenkins/secrets/initialAdminPassword
+    Properties:
+      ImageId: !Ref LatestLinuxAmiId
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      KeyName: !Ref KeyName
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -xe
+            #updating system packages
+            apt-get update -y
+            apt-get install -y python-setuptools python-pip
+            # Get the latest CloudFormation package
+            pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+            # Start cfn-init
+            /usr/local/bin/cfn-init -v --stack ${AWS::StackId} --resource JenkinsServerHost --region ${AWS::Region} --configsets default
+            # Start cfn-signal to the wait condition
+            /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource JenkinsServerHost --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: "PT5M"
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          CidrIp: '0.0.0.0/0'
+
+Outputs:
+  JenkinsURL:
+    Description: Public DNSName of the newly created EC2 instance
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - JenkinsServerHost
+          - PublicDnsName
+        - ':8080'
